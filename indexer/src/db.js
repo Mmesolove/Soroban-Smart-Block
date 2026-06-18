@@ -88,6 +88,9 @@ export const db = {
       -- Protocol 26: TTL extension host function data (extend_to, min_extension, max_extension)
       ALTER TABLE events ADD COLUMN IF NOT EXISTS ttl_extension JSONB;
 
+      -- Issue #169: fee-bump chain of custody (sponsor, channel account, actual caller)
+      ALTER TABLE events ADD COLUMN IF NOT EXISTS fee_bump JSONB;
+
       -- Issue #117: sub-invocation indexing
       CREATE TABLE IF NOT EXISTS sub_invocations (
         id              BIGSERIAL PRIMARY KEY,
@@ -130,6 +133,19 @@ export const db = {
       );
       CREATE INDEX IF NOT EXISTS idx_state_diff_contract_ledger
         ON storage_state_diffs(contract_id, ledger ASC);
+
+      -- Issue #172: CAP-0077 quorum freeze events
+      CREATE TABLE IF NOT EXISTS quorum_freezes (
+        id          BIGSERIAL PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        frozen_ids  JSONB NOT NULL,
+        ledger      BIGINT,
+        tx_hash     TEXT,
+        is_frozen   BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_quorum_freezes_contract
+        ON quorum_freezes(contract_id);
     `);
   },
 
@@ -200,8 +216,8 @@ export const db = {
       `INSERT INTO events
          (contract_id, function, ledger, tx_hash, description, raw_topics, raw_data,
           cpu_instructions, mem_bytes, fee_charged, is_high_bloat_risk, upgrade_info, storage_tiers, is_clawback,
-          footprint_contention, ttl_extension)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+          footprint_contention, ttl_extension, fee_bump, archival_info)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
        ON CONFLICT DO NOTHING`,
       [
         ev.contract_id, ev.function, ev.ledger, ev.tx_hash,
@@ -213,6 +229,8 @@ export const db = {
         ev.is_clawback ?? false,
         ev.footprint_contention ?? false,
         ev.ttl_extension ? JSON.stringify(ev.ttl_extension) : null,
+        ev.fee_bump ? JSON.stringify(ev.fee_bump) : null,
+        ev.archival_info ? JSON.stringify(ev.archival_info) : null,
       ]
     );
   },
@@ -543,5 +561,68 @@ export const db = {
       params
     );
     return rows;
+  },
+
+ wasm-build-metadata-indexing
+  // ── WASM build metadata ────────────────────────────────────────────────────
+
+  async upsertWasmBuildMetadata({ wasm_hash, contract_id, sdk_version, compiler, optimizer, repository, commit, producers, ledger, tx_hash }) {
+    await pool.query(
+      `INSERT INTO wasm_build_metadata
+         (wasm_hash, contract_id, sdk_version, compiler, optimizer, repository, commit, producers, ledger, tx_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (wasm_hash) DO UPDATE SET
+         contract_id = COALESCE(EXCLUDED.contract_id, wasm_build_metadata.contract_id),
+         sdk_version = COALESCE(EXCLUDED.sdk_version, wasm_build_metadata.sdk_version),
+         compiler    = COALESCE(EXCLUDED.compiler,    wasm_build_metadata.compiler),
+         optimizer   = COALESCE(EXCLUDED.optimizer,   wasm_build_metadata.optimizer),
+         repository  = COALESCE(EXCLUDED.repository,  wasm_build_metadata.repository),
+         commit      = COALESCE(EXCLUDED.commit,      wasm_build_metadata.commit),
+         producers   = COALESCE(EXCLUDED.producers,   wasm_build_metadata.producers)`,
+      [wasm_hash, contract_id ?? null, sdk_version ?? null, compiler ?? null,
+       optimizer ?? null, repository ?? null, commit ?? null,
+       producers ? JSON.stringify(producers) : null, ledger ?? null, tx_hash ?? null]
+    );
+  },
+
+  async getWasmBuildMetadata(contract_id) {
+    const { rows } = await pool.query(
+      `SELECT * FROM wasm_build_metadata WHERE contract_id = $1 ORDER BY ledger DESC LIMIT 1`,
+      [contract_id]
+    );
+    return rows[0] ?? null;
+=======
+  /** Issue #117: persist sub-invocation records. */
+  async upsertSubInvocations(records) {
+    if (!records.length) return;
+    const values = records.map((r, i) => {
+      const base = i * 6;
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+    }).join(", ");
+    const params = records.flatMap(r => [
+      r.parent_tx_hash, r.depth, r.contract_id, r.function,
+      r.args ? JSON.stringify(r.args) : null, r.ledger,
+    ]);
+    await pool.query(
+      `INSERT INTO sub_invocations (parent_tx_hash, depth, contract_id, function, args, ledger)
+       VALUES ${values} ON CONFLICT DO NOTHING`,
+      params
+    );
+  },
+
+  /** Issue #142: aggregate caller→callee edges for the global dependency graph. */
+  async getSubInvocationEdges(limit = 500) {
+    const { rows } = await pool.query(
+      `SELECT e.contract_id AS caller, s.contract_id AS callee, COUNT(*) AS call_count
+       FROM sub_invocations s
+       JOIN events e ON e.tx_hash = s.parent_tx_hash
+       WHERE e.contract_id <> s.contract_id
+       GROUP BY e.contract_id, s.contract_id
+       ORDER BY call_count DESC
+       LIMIT $1`,
+      [limit]
+    );
+    return rows.map(r => ({ caller: r.caller, callee: r.callee, call_count: Number(r.call_count) }));
+ main
   },
 };
